@@ -45,6 +45,7 @@
 #include <sensor_msgs/Imu.h>
 #include <geometry_msgs/Twist.h>
 #include <diagnostic_msgs/DiagnosticArray.h>
+#include <advanced_navigation_driver/NavSatMisc.h>
 
 #define RADIANS_TO_DEGREES (180.0/M_PI)
 const double PI = 4*atan(1);
@@ -70,7 +71,7 @@ int main(int argc, char *argv[]) {
 	std::string imu_frame_id;
 	std::string nav_sat_frame_id;
 	std::string topic_prefix;
-	bool device_time, remove_gravity;
+	bool device_time, remove_gravity, nav_sat_misc_msg;
 	tf::Quaternion orientation;
 
 	if (argc >= 3) {
@@ -92,6 +93,7 @@ int main(int argc, char *argv[]) {
 	pnh.param("topic_prefix", topic_prefix, std::string("an_device"));
 	pnh.param("device_time", device_time, false);
 	pnh.param("remove_gravity", remove_gravity, false);
+	pnh.param("nav_sat_misc_msg", nav_sat_misc_msg, false);
 
 	// Initialise Publishers and Topics //
 	ros::Publisher nav_sat_fix_pub=nh.advertise<sensor_msgs::NavSatFix>(topic_prefix + "/NavSatFix",10);
@@ -99,6 +101,8 @@ int main(int argc, char *argv[]) {
 	ros::Publisher imu_pub=nh.advertise<sensor_msgs::Imu>(topic_prefix + "/Imu",10);
 	ros::Publisher system_status_pub=nh.advertise<diagnostic_msgs::DiagnosticStatus>(topic_prefix + "/SystemStatus",10);
 	ros::Publisher filter_status_pub=nh.advertise<diagnostic_msgs::DiagnosticStatus>(topic_prefix + "/FilterStatus",10);
+	ros::Publisher nav_sat_misc_pub;
+	if(nav_sat_misc_msg) nav_sat_misc_pub=nh.advertise<advanced_navigation_driver::NavSatMisc>(topic_prefix + "/NavSatMisc",10);
 
 	// Initialise messages
 	sensor_msgs::NavSatFix nav_sat_fix_msg;
@@ -149,12 +153,15 @@ int main(int argc, char *argv[]) {
 	filter_status_msg.name = "Filter Status";
 	filter_status_msg.message = "";
 
+	advanced_navigation_driver::NavSatMisc misc_msg;
+
 	// get data from com port //
 	an_decoder_t an_decoder;
 	an_packet_t *an_packet;
 	system_state_packet_t system_state_packet;
 	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
 	raw_sensors_packet_t raw_sensors_packet;
+	satellites_packet_t satellites_packet;
 	int bytes_received;
 
 	if (OpenComport(const_cast<char*>(com_port.c_str()), baud_rate))
@@ -183,6 +190,11 @@ int main(int argc, char *argv[]) {
 	period_packet.packet_periods[1].period = period;
 	period_packet.packet_periods[2].packet_id = packet_id_quaternion_orientation_standard_deviation;
 	period_packet.packet_periods[2].period = period;
+	if(nav_sat_misc_msg)
+	{
+		period_packet.packet_periods[3].packet_id = packet_id_satellites;
+		period_packet.packet_periods[3].period = period;
+	}
 	an_packet = encode_packet_periods_packet(&period_packet);
 	an_packet_encode(an_packet);
 	SendBuf(an_packet_pointer(an_packet), an_packet_size(an_packet));
@@ -495,6 +507,25 @@ int main(int argc, char *argv[]) {
 					}
 				}
 
+				// misc satellite information //
+				if (nav_sat_misc_msg && an_packet->id == packet_id_raw_satellite_data)
+				{
+					// copy all the binary data into the typedef struct for the packet //
+					// this allows easy access to all the different values			 //
+					if (decode_satellites_packet(&satellites_packet, an_packet) == 0)
+					{
+						// Number of satellites
+						// NavSatFix
+						misc_msg.header.stamp.sec=system_state_packet.unix_time_seconds;
+						misc_msg.header.stamp.nsec=system_state_packet.microseconds*1000;
+						misc_msg.header.frame_id=nav_sat_frame_id;
+						misc_msg.number_satellites=satellites_packet.gps_satellites +
+						                           satellites_packet.glonass_satellites +
+						                           satellites_packet.beidou_satellites +
+						                           satellites_packet.sbas_satellites;
+					}
+				}
+
 				// Ensure that you free the an_packet when your done with it //
 				// or you will leak memory                                   //
 				an_packet_free(&an_packet);
@@ -507,7 +538,8 @@ int main(int argc, char *argv[]) {
 				// check that we have at least one of each required packages
 				if (!packets_received[packet_id_system_state] ||
 				    !packets_received[packet_id_quaternion_orientation_standard_deviation] ||
-				    (!packets_received[packet_id_raw_sensors] || remove_gravity))
+				    (!packets_received[packet_id_raw_sensors] || remove_gravity) ||
+				    (!packets_received[packet_id_raw_satellite_data] && nav_sat_misc_msg))
 					continue;
 
 				memset(packets_received, 0, sizeof(packets_received));
@@ -524,6 +556,7 @@ int main(int argc, char *argv[]) {
 				imu_pub.publish(imu_msg);
 				system_status_pub.publish(system_status_msg);
 				filter_status_pub.publish(filter_status_msg);
+				if(nav_sat_misc_msg) nav_sat_misc_pub.publish(misc_msg);
 			}
 		}
 	}
